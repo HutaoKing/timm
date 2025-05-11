@@ -1,13 +1,12 @@
 import os
 import random
 from easydict import EasyDict
-from PIL import Image
-
 import numpy as np
 import torch
-from torch import nn, optim
+from torch import nn
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torchvision import datasets, transforms
 import timm
 from tqdm import tqdm
 from multiprocessing import freeze_support
@@ -17,191 +16,159 @@ from multiprocessing import freeze_support
 # -------------------------------------------------------------------------
 config = EasyDict({
     "num_classes":      26,
-    "image_height":     224,
-    "image_width":      224,
+    "image_size":       224,
     "batch_size":       24,
-    "eval_batch_size":  10,
-    "epochs":           10,
-    "lr_max":           0.01,
-    "decay_type":       'constant',  # 'constant' or 'cosine'
-    "momentum":         0.8,
-    "weight_decay":     3.0,
-    "dataset_path":     "./datasets/5fbdf571c06d3433df85ac65-momodel/garbage_26x100",
-    "save_ckpt_epochs": 1,
-    "save_ckpt_path":   "./results/ckpt_timm",
-    "model_name":       "seresnext50_32x4d.racm_in1k",
+    "eval_batch_size":  32,
+    "epochs":           20,
+    "lr":               1e-3,
+    "weight_decay":     0.05,
+    "dropout_prob":     0.2,
     "seed":             42,
+    "dataset_path":     "./datasets/5fbdf571c06d3433df85ac65-momodel/garbage_26x100",
+    "model_name":       "seresnext50_32x4d",  # timm 内置名
+    "device":           "cuda" if torch.cuda.is_available() else "cpu",
+    "num_workers":      8,
 })
 
 # -------------------------------------------------------------------------
-# 2. 自定义 SubsetWithTransform，用于按索引切分并应用不同 transform
+# 2. 随机种子
 # -------------------------------------------------------------------------
+torch.manual_seed(config.seed)
+random.seed(config.seed)
+np.random.seed(config.seed)
+if config.device == "cuda":
+    torch.cuda.manual_seed_all(config.seed)
+
+# -------------------------------------------------------------------------
+# 3. 数据增强 & DataLoader
+# -------------------------------------------------------------------------
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(config.image_size),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(0.2,0.2,0.2,0.1),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+    transforms.RandomErasing(p=0.1),
+])
+val_transform = transforms.Compose([
+    transforms.Resize(int(config.image_size*1.15)),
+    transforms.CenterCrop(config.image_size),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+])
+
+base_ds = datasets.ImageFolder(config.dataset_path, transform=None)
+N = len(base_ds)
+idxs = list(range(N))
+random.shuffle(idxs)
+split = int(0.7 * N)
+train_idx, val_idx = idxs[:split], idxs[split:]
+
 class SubsetWithTransform(Dataset):
-    def __init__(self, filepaths, labels, indices, transform):
-        self.filepaths = filepaths
-        self.labels = labels
-        self.indices = indices
-        self.transform = transform
-
+    def __init__(self, base_ds, indices, transform):
+        self.ds = base_ds
+        self.idx = indices
+        self.tf = transform
     def __len__(self):
-        return len(self.indices)
+        return len(self.idx)
+    def __getitem__(self, i):
+        path, lbl = self.ds.samples[self.idx[i]]
+        img = self.ds.loader(path).convert("RGB")
+        return self.tf(img), lbl
 
-    def __getitem__(self, idx):
-        real_idx = self.indices[idx]
-        path = self.filepaths[real_idx]
-        label = self.labels[real_idx]
-        img = Image.open(path).convert('RGB')
-        if self.transform:
-            img = self.transform(img)
-        return img, label
+train_ds = SubsetWithTransform(base_ds, train_idx, train_transform)
+val_ds   = SubsetWithTransform(base_ds, val_idx,   val_transform)
+
+train_loader = DataLoader(train_ds, batch_size=config.batch_size,
+                          shuffle=True,  num_workers=config.num_workers, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=config.eval_batch_size,
+                          shuffle=False, num_workers=config.num_workers, pin_memory=True)
 
 # -------------------------------------------------------------------------
-# 3. 主函数
+# 4. 模型 & 损失 & 优化器 & 调度
 # -------------------------------------------------------------------------
-def main():
-    # 3.1 随机种子
-    torch.manual_seed(config.seed)
-    random.seed(config.seed)
-    np.random.seed(config.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.seed)
+device = torch.device(config.device)
+# 4.1 创建带 dropout 的 head
+class HeadWithDropout(nn.Sequential):
+    def __init__(self, in_features, num_classes, p=0.2):
+        super().__init__(
+            nn.Dropout(p),
+            nn.Linear(in_features, num_classes),
+        )
 
-    # 3.2 定义 train/val 两种 transform
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(config.image_height),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(0.1, 0.1, 0.1, 0.1),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
-    ])
-    val_transform = transforms.Compose([
-        transforms.Resize(int(config.image_height * 1.15)),
-        transforms.CenterCrop(config.image_height),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
-    ])
+# 4.2 从 timm 加载模型（pretrained=True）
+model = timm.create_model(
+    config.model_name,
+    pretrained=True,
+    num_classes=config.num_classes,
+)
+# 替换 classifier
+in_feats = model.get_classifier().in_features
+model.reset_classifier(0)  # 清掉原来的 head
+model.classifier = HeadWithDropout(in_feats, config.num_classes, p=config.dropout_prob)
+model = model.to(device)
 
-    # 3.3 扫描 dataset_path 下 train/val 两级目录，收集所有图像路径和标签
-    filepaths = []
-    labels = []
-    # 获取所有类别名（假设 train 和 val 下的子文件夹是一致的）
-    class_names = sorted(os.listdir(os.path.join(config.dataset_path, "train")))
-    print(class_names)
-    class_to_idx = {cls_name: idx for idx, cls_name in enumerate(class_names)}
+# 4.3 损失函数（带 label smoothing）
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    for phase in ["train", "val"]:
-        phase_dir = os.path.join(config.dataset_path, phase)
-        for cls_name in class_names:
-            cls_dir = os.path.join(phase_dir, cls_name)
-            if not os.path.isdir(cls_dir):
-                continue
-            for fname in os.listdir(cls_dir):
-                if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
-                    filepaths.append(os.path.join(cls_dir, fname))
-                    labels.append(class_to_idx[cls_name])
+# 4.4 优化器 & 调度
+optimizer = AdamW(
+    model.parameters(),
+    lr=config.lr,
+    weight_decay=config.weight_decay
+)
+# Cosine 重启调度，t_initial = total epoch
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    optimizer, T_0=config.epochs, T_mult=1, eta_min=1e-6
+)
 
-    # 3.4 按 7:3 随机划分索引
-    dataset_size = len(filepaths)
-    indices = list(range(dataset_size))
-    random.shuffle(indices)
-    train_size = int(0.7 * dataset_size)
-    train_idx = indices[:train_size]
-    val_idx = indices[train_size:]
+# -------------------------------------------------------------------------
+# 5. 训练 & 验证函数
+# -------------------------------------------------------------------------
+def train_one_epoch(e):
+    model.train()
+    total_loss, count = 0., 0
+    loop = tqdm(train_loader, desc=f"[Train] Epoch {e}", leave=False)
+    for imgs, labels in loop:
+        imgs, labels = imgs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        logits = model(imgs)
+        loss = criterion(logits, labels)
+        loss.backward()
+        # 梯度裁剪
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_loss += loss.item() * imgs.size(0)
+        count += imgs.size(0)
+        loop.set_postfix(loss=total_loss/count)
+    scheduler.step()
+    return total_loss / count
 
-    # 3.5 构造 Dataset 和 DataLoader
-    train_ds = SubsetWithTransform(filepaths, labels, train_idx, train_transform)
-    val_ds = SubsetWithTransform(filepaths, labels, val_idx, val_transform)
+def validate(e):
+    model.eval()
+    correct, count = 0, 0
+    loop = tqdm(val_loader, desc=f"[ Val ] Epoch {e}", leave=False)
+    with torch.no_grad():
+        for imgs, labels in loop:
+            imgs, labels = imgs.to(device), labels.to(device)
+            preds = model(imgs).argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            count += imgs.size(0)
+            loop.set_postfix(acc=correct/count)
+    return correct / count
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=config.eval_batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
-
-    # 3.6 模型 & 预训练权重加载
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = timm.create_model(config.model_name, pretrained=False, num_classes=config.num_classes)
-    state_dict = torch.load('pretrain_model/seresnext50_32x4d.pth', map_location=device)
-    model_dict = model.state_dict()
-    filtered = {
-        k: v for k, v in state_dict.items()
-        if k in model_dict and v.size() == model_dict[k].size()
-    }
-    model_dict.update(filtered)
-    model.load_state_dict(model_dict)
-    print("Successfully loaded pretrained weights!")
-    model = model.to(device)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(
-        model.parameters(),
-        lr=config.lr_max,
-        momentum=config.momentum,
-        weight_decay=config.weight_decay
-    )
-    scheduler = None
-    if config.decay_type == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
-
-    # 3.7 训练与验证函数
-    def train_one_epoch(epoch):
-        model.train()
-        running_loss = 0.0
-        with tqdm(train_loader, desc=f"Epoch {epoch} [Train]", unit="batch") as t:
-            for imgs, labels in t:
-                imgs, labels = imgs.to(device), labels.to(device)
-                optimizer.zero_grad()
-                logits = model(imgs)
-                loss = criterion(logits, labels)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item() * imgs.size(0)
-                t.set_postfix(loss=running_loss / ((t.n + 1) * config.batch_size))
-        return running_loss / len(train_loader.dataset)
-
-    def validate(epoch):
-        model.eval()
-        correct = 0
-        with torch.no_grad(), tqdm(val_loader, desc=f"Epoch {epoch} [Val]", unit="batch") as t:
-            for imgs, labels in t:
-                imgs, labels = imgs.to(device), labels.to(device)
-                logits = model(imgs)
-                preds = logits.argmax(dim=1)
-                correct += (preds == labels).sum().item()
-                t.set_postfix(acc=correct / ((t.n + 1) * config.eval_batch_size))
-        return correct / len(val_loader.dataset)
-
-    # 3.8 主训练循环
-    os.makedirs(config.save_ckpt_path, exist_ok=True)
-    best_acc = 0.0
-    for epoch in range(1, config.epochs + 1):
-        loss = train_one_epoch(epoch)
-        acc = validate(epoch)
-        if scheduler:
-            scheduler.step()
-        print(f"Epoch {epoch}/{config.epochs}    loss={loss:.4f}    val_acc={acc:.4%}")
-        if epoch % config.save_ckpt_epochs == 0:
-            ckpt_name = f"{config.model_name.replace('.', '_')}-epoch{epoch}.pth"
-            torch.save({
-                'epoch': epoch,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'val_acc': acc
-            }, os.path.join(config.save_ckpt_path, ckpt_name))
-            print(f"  --> Saved checkpoint: {ckpt_name}")
-        best_acc = max(best_acc, acc)
-
-    print(f"Training done, best val_acc={best_acc:.4%}")
-
-if __name__ == "__main__":
-    freeze_support()
-    main()
+# -------------------------------------------------------------------------
+# 6. 主训练循环
+# -------------------------------------------------------------------------
+os.makedirs("./results/ckpt_timm", exist_ok=True)
+best_acc = 0.0
+for epoch in range(1, config.epochs+1):
+    train_loss = train_one_epoch(epoch)
+    val_acc    = validate(epoch)
+    print(f"Epoch {epoch}/{config.epochs}  loss={train_loss:.4f}  val_acc={val_acc*100:.2f}%")
+    # 保存最好模型
+    if val_acc > best_acc:
+        best_acc = val_acc
+        torch.save(model.state_dict(), f"./results/ckpt_timm/best.pth")
+print(f"Training finished, best val_acc={best_acc*100:.2f}%")
