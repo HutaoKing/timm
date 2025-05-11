@@ -1,225 +1,134 @@
-import os
-import random
-from easydict import EasyDict
-
-import numpy as np
 import torch
-from torch import nn
-from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets, transforms
+import os
 import timm
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
 from tqdm import tqdm
-from multiprocessing import freeze_support
 
-# -------------------------------------------------------------------------
-# 1. 配置
-# -------------------------------------------------------------------------
-config = EasyDict({
-    "num_classes":      26,
-    "image_size":       224,
-    "batch_size":       24,
-    "eval_batch_size":  32,
-    "head_epochs":      5,      # 先训练 head 的 epoch
-    "finetune_epochs":  15,     # 微调全网的 epoch
-    "lr_head":          1e-3,   # 训练 head 时的学习率
-    "lr_ft":            1e-4,   # 微调时的学习率
-    "weight_decay":     0.05,
-    "dropout_prob":     0.2,
-    "seed":             42,
-    "dataset_path":     "./datasets/5fbdf571c06d3433df85ac65-momodel/garbage_26x100",
-    "pretrained_ckpt":  "pretrain_model/seresnext50_32x4d.pth",
-    "save_dir":         "./results/ckpt_timm",
-    "device":           "cuda" if torch.cuda.is_available() else "cpu",
-    "num_workers":      4,      # Windows 下可适当调小或设为 0
-})
+# -------------------- 配置 --------------------
+data_dir = './datasets/5fbdf571c06d3433df85ac65-momodel/garbage_26x100'
+train_dir = os.path.join(data_dir, 'train')
+val_dir   = os.path.join(data_dir, 'val')
+pretrained_model_path = './pretrain_model/seresnext50_32x4d.pth'
 
-# -------------------------------------------------------------------------
-# 2. 随机种子
-# -------------------------------------------------------------------------
-torch.manual_seed(config.seed)
-random.seed(config.seed)
-np.random.seed(config.seed)
-if config.device == "cuda":
-    torch.cuda.manual_seed_all(config.seed)
+batch_size    = 32
+epochs        = 20
+learning_rate = 1e-4
+device        = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# -------------------------------------------------------------------------
-# 3. 自定义 Dataset 与 DataLoader
-# -------------------------------------------------------------------------
-class SubsetDS(Dataset):
-    def __init__(self, samples, labels, transform):
-        self.samples = samples
-        self.labels = labels
-        self.tf = transform
+print(f"Training on device: {device.upper()}")
 
-    def __len__(self):
-        return len(self.samples)
+# ---------------- 数据准备 ----------------
+transform = transforms.Compose([
+    transforms.Resize(224),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225]),
+])
 
-    def __getitem__(self, idx):
-        path = self.samples[idx]
-        lbl = self.labels[idx]
-        img = transforms.functional.pil_to_tensor(__import__("PIL").Image.open(path).convert("RGB"))
-        img = transforms.functional.convert_image_dtype(img, dtype=torch.float)
-        img = transforms.functional.resize(img, [config.image_size, config.image_size])
-        img = self.tf(transforms.functional.to_pil_image(img))
-        return img, lbl
+train_dataset = ImageFolder(train_dir, transform=transform)
+val_dataset   = ImageFolder(val_dir,   transform=transform)
 
-def make_dataloaders():
-    # 数据增强
-    train_tf = transforms.Compose([
-        transforms.RandomResizedCrop(config.image_size),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(0.2,0.2,0.2,0.1),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
-        transforms.RandomErasing(p=0.1),
-    ])
-    val_tf = transforms.Compose([
-        transforms.Resize(int(config.image_size * 1.15)),
-        transforms.CenterCrop(config.image_size),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
-    ])
+train_loader = DataLoader(train_dataset,
+                          batch_size=batch_size,
+                          shuffle=True,
+                          num_workers=4,
+                          pin_memory=(device=='cuda'))
+val_loader   = DataLoader(val_dataset,
+                          batch_size=batch_size,
+                          shuffle=False,
+                          num_workers=4,
+                          pin_memory=(device=='cuda'))
 
-    # 扫描所有文件和标签
-    base = datasets.ImageFolder(config.dataset_path, transform=None)
-    samples = [s[0] for s in base.samples]
-    labels  = [s[1] for s in base.samples]
+# ---------------- 模型构建 ----------------
+# 1) 先加载原始的 1000 类模型
+model = timm.create_model('seresnext50_32x4d', pretrained=False)
+#print("Original model.fc:", model.fc)  # debug: 查看原始 fc
 
-    # 70/30 随机划分
-    N = len(samples)
-    idxs = list(range(N))
-    random.shuffle(idxs)
-    split = int(0.7 * N)
-    train_idxs, val_idxs = idxs[:split], idxs[split:]
+# 2) 读取 checkpoint
+checkpoint = torch.load(pretrained_model_path, map_location=device)
+# 如果 checkpoint 是个 dict 且有 'state_dict' 键，就取它
+state_dict = checkpoint.get('state_dict', checkpoint)
+#print("Checkpoint keys sample:", list(state_dict.keys())[:5])  # debug: 看几条 key
 
-    train_samples = [samples[i] for i in train_idxs]
-    train_labels  = [labels[i]  for i in train_idxs]
-    val_samples   = [samples[i] for i in val_idxs]
-    val_labels    = [labels[i]  for i in val_idxs]
+# 3) 删除最后一层 fc 的权重，以避免大小不匹配
+for k in ['fc.weight', 'fc.bias']:
+    if k in state_dict:
+        #print(f"Removing key from checkpoint: {k}")  # debug
+        del state_dict[k]
 
-    train_ds = SubsetDS(train_samples, train_labels, train_tf)
-    val_ds   = SubsetDS(val_samples,   val_labels,   val_tf)
+# 4) 加载剩余权重
+model.load_state_dict(state_dict, strict=False)
+#print("Loaded pretrained weights except fc.")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=config.eval_batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
-    return train_loader, val_loader
+# 5) 替换分类头为 26 类
+model.fc = nn.Linear(model.num_features, 26)
+#print("New model.fc:", model.fc)  # debug: 查看新 fc
 
-# -------------------------------------------------------------------------
-# 4. 模型构建与权重加载
-# -------------------------------------------------------------------------
-def build_model():
-    device = torch.device(config.device)
+model = model.to(device)
 
-    # 创建 backbone + 自定义 head
-    model = timm.create_model("seresnext50_32x4d", pretrained=False, num_classes=0)
-    in_feats = model.num_features
-    model.reset_classifier(0)
-    model.classifier = nn.Sequential(
-        nn.Dropout(config.dropout_prob),
-        nn.Linear(in_feats, config.num_classes)
-    )
-    model = model.to(device)
+# ---------------- 损失 & 优化器 ----------------
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    # 加载本地 backbone 权重（忽略 fc 层）
-    if os.path.exists(config.pretrained_ckpt):
-        sd = torch.load(config.pretrained_ckpt, map_location=device)
-        sd.pop("fc.weight", None)
-        sd.pop("fc.bias",   None)
-        model.load_state_dict(sd, strict=False)
-        print("✅ Loaded backbone weights (fc ignored).")
-    else:
-        print("⚠️  Pretrained checkpoint not found, training from scratch.")
-
-    return model
-
-# -------------------------------------------------------------------------
-# 5. 训练与验证
-# -------------------------------------------------------------------------
-def train_one_epoch(model, loader, optimizer, criterion):
+# ---------------- 训练函数 ----------------
+def train_model():
     model.train()
-    total_loss, count = 0.0, 0
-    for imgs, labels in tqdm(loader, desc="Training", leave=False):
-        imgs, labels = imgs.to(config.device), labels.to(config.device)
-        optimizer.zero_grad()
-        logits = model(imgs)
-        loss = criterion(logits, labels)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        total_loss += loss.item() * imgs.size(0)
-        count += imgs.size(0)
-    return total_loss / count
+    for epoch in range(1, epochs + 1):
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        loop = tqdm(train_loader,
+                    desc=f'Epoch[{epoch}/{epochs}]',
+                    ncols=100)
+        for inputs, labels in loop:
+            inputs, labels = inputs.to(device), labels.to(device)
 
-def validate(model, loader, criterion):
-    model.eval()
-    correct, count = 0, 0
-    val_loss = 0.0
-    with torch.no_grad():
-        for imgs, labels in tqdm(loader, desc="Validating", leave=False):
-            imgs, labels = imgs.to(config.device), labels.to(config.device)
-            logits = model(imgs)
-            loss = criterion(logits, labels)
-            preds = logits.argmax(dim=1)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * inputs.size(0)
+            preds = outputs.argmax(dim=1)
             correct += (preds == labels).sum().item()
-            val_loss += loss.item() * imgs.size(0)
-            count += imgs.size(0)
-    return val_loss / count, correct / count
+            total += labels.size(0)
 
-# -------------------------------------------------------------------------
-# 6. 主函数 (必须在 Windows 下这样写)
-# -------------------------------------------------------------------------
-def main():
-    freeze_support()  # Windows 多进程必需
-    os.makedirs(config.save_dir, exist_ok=True)
+            loop.set_postfix({
+                'loss': f'{running_loss/total:.4f}',
+                'acc':  f'{100*correct/total:.2f}%'
+            })
 
-    train_loader, val_loader = make_dataloaders()
-    model = build_model()
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        epoch_loss = running_loss / len(train_dataset)
+        epoch_acc  = 100. * correct / total
+        print(f'>>> Epoch {epoch:02d}: Train Loss: {epoch_loss:.4f}, '
+              f'Train Acc: {epoch_acc:.2f}%')
 
-    # 阶段一：只训练 head
-    for p in model.parameters():
-        p.requires_grad = False
-    for p in model.classifier.parameters():
-        p.requires_grad = True
+        torch.save(model.state_dict(), f'model_epoch_{epoch}.pth')
 
-    optimizer = AdamW(model.classifier.parameters(), lr=config.lr_head, weight_decay=config.weight_decay)
-    best_acc = 0.0
-    for epoch in range(1, config.head_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion)
-        val_loss, val_acc = validate(model, val_loader, criterion)
-        print(f"[Head ] Epoch {epoch}/{config.head_epochs}  loss={train_loss:.4f}  val_acc={val_acc*100:.2f}%")
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), os.path.join(config.save_dir, "best_head.pth"))
+# ---------------- 验证函数 ----------------
+def evaluate_model():
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, labels in tqdm(val_loader,
+                                   desc='Validation',
+                                   ncols=100):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
 
-    # 阶段二：微调整个模型
-    for p in model.parameters():
-        p.requires_grad = True
+    val_acc = 100. * correct / total
+    print(f'>>> Validation Accuracy: {val_acc:.2f}%')
 
-    optimizer = AdamW(model.parameters(), lr=config.lr_ft, weight_decay=config.weight_decay)
-    for epoch in range(1, config.finetune_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion)
-        val_loss, val_acc = validate(model, val_loader, criterion)
-        print(f"[Fine ] Epoch {epoch}/{config.finetune_epochs}  loss={train_loss:.4f}  val_acc={val_acc*100:.2f}%")
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), os.path.join(config.save_dir, "best_finetune.pth"))
-
-    print(f"🎉 Training complete, best val_acc = {best_acc*100:.2f}%")
-
-if __name__ == "__main__":
-    main()
+# ---------------- 主流程 ----------------
+if __name__ == '__main__':
+    train_model()
+    evaluate_model()
