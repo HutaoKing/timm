@@ -1,12 +1,13 @@
 import os
 import random
 from easydict import EasyDict
+from PIL import Image
 
 import numpy as np
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets, transforms
+from torchvision import transforms
 import timm
 from tqdm import tqdm
 from multiprocessing import freeze_support
@@ -33,11 +34,12 @@ config = EasyDict({
 })
 
 # -------------------------------------------------------------------------
-# 2. 定义 SubsetWithTransform 在模块顶层以支持多进程 DataLoader
+# 2. 自定义 SubsetWithTransform，用于按索引切分并应用不同 transform
 # -------------------------------------------------------------------------
 class SubsetWithTransform(Dataset):
-    def __init__(self, base_ds, indices, transform):
-        self.base_ds = base_ds
+    def __init__(self, filepaths, labels, indices, transform):
+        self.filepaths = filepaths
+        self.labels = labels
         self.indices = indices
         self.transform = transform
 
@@ -45,8 +47,10 @@ class SubsetWithTransform(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        path, label = self.base_ds.samples[self.indices[idx]]
-        img = self.base_ds.loader(path)
+        real_idx = self.indices[idx]
+        path = self.filepaths[real_idx]
+        label = self.labels[real_idx]
+        img = Image.open(path).convert('RGB')
         if self.transform:
             img = self.transform(img)
         return img, label
@@ -62,7 +66,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.seed)
 
-    # 3.2 数据增强与加载
+    # 3.2 定义 train/val 两种 transform
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(config.image_height),
         transforms.RandomHorizontalFlip(),
@@ -77,17 +81,36 @@ def main():
         transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
     ])
 
-    base_ds = datasets.ImageFolder(config.dataset_path, transform=None)
-    dataset_size = len(base_ds)
-    val_size = int(0.2 * dataset_size)
-    train_size = dataset_size - val_size
+    # 3.3 扫描 dataset_path 下 train/val 两级目录，收集所有图像路径和标签
+    filepaths = []
+    labels = []
+    # 获取所有类别名（假设 train 和 val 下的子文件夹是一致的）
+    class_names = sorted(os.listdir(os.path.join(config.dataset_path, "train")))
+    print(class_names)
+    class_to_idx = {cls_name: idx for idx, cls_name in enumerate(class_names)}
 
+    for phase in ["train", "val"]:
+        phase_dir = os.path.join(config.dataset_path, phase)
+        for cls_name in class_names:
+            cls_dir = os.path.join(phase_dir, cls_name)
+            if not os.path.isdir(cls_dir):
+                continue
+            for fname in os.listdir(cls_dir):
+                if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+                    filepaths.append(os.path.join(cls_dir, fname))
+                    labels.append(class_to_idx[cls_name])
+
+    # 3.4 按 7:3 随机划分索引
+    dataset_size = len(filepaths)
     indices = list(range(dataset_size))
     random.shuffle(indices)
-    train_idx, val_idx = indices[:train_size], indices[train_size:]
+    train_size = int(0.7 * dataset_size)
+    train_idx = indices[:train_size]
+    val_idx = indices[train_size:]
 
-    train_ds = SubsetWithTransform(base_ds, train_idx, train_transform)
-    val_ds = SubsetWithTransform(base_ds, val_idx, val_transform)
+    # 3.5 构造 Dataset 和 DataLoader
+    train_ds = SubsetWithTransform(filepaths, labels, train_idx, train_transform)
+    val_ds = SubsetWithTransform(filepaths, labels, val_idx, val_transform)
 
     train_loader = DataLoader(
         train_ds,
@@ -104,12 +127,15 @@ def main():
         pin_memory=True
     )
 
-    # 3.3 模型 & 预训练权重加载
+    # 3.6 模型 & 预训练权重加载
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = timm.create_model(config.model_name, pretrained=False, num_classes=config.num_classes)
     state_dict = torch.load('pretrain_model/seresnext50_32x4d.pth', map_location=device)
     model_dict = model.state_dict()
-    filtered = {k: v for k, v in state_dict.items() if k in model_dict and v.size() == model_dict[k].size()}
+    filtered = {
+        k: v for k, v in state_dict.items()
+        if k in model_dict and v.size() == model_dict[k].size()
+    }
     model_dict.update(filtered)
     model.load_state_dict(model_dict)
     print("Successfully loaded pretrained weights!")
@@ -126,7 +152,7 @@ def main():
     if config.decay_type == 'cosine':
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
 
-    # 3.4 训练与验证函数
+    # 3.7 训练与验证函数
     def train_one_epoch(epoch):
         model.train()
         running_loss = 0.0
@@ -154,7 +180,7 @@ def main():
                 t.set_postfix(acc=correct / ((t.n + 1) * config.eval_batch_size))
         return correct / len(val_loader.dataset)
 
-    # 3.5 主训练循环
+    # 3.8 主训练循环
     os.makedirs(config.save_ckpt_path, exist_ok=True)
     best_acc = 0.0
     for epoch in range(1, config.epochs + 1):
@@ -173,6 +199,7 @@ def main():
             }, os.path.join(config.save_ckpt_path, ckpt_name))
             print(f"  --> Saved checkpoint: {ckpt_name}")
         best_acc = max(best_acc, acc)
+
     print(f"Training done, best val_acc={best_acc:.4%}")
 
 if __name__ == "__main__":
